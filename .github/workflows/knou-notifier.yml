@@ -1,0 +1,67 @@
+name: KNOU notice notifier
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      send_test:
+        description: "Send a Telegram test message"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: knou-notice-notifier
+  cancel-in-progress: false
+
+jobs:
+  check-notices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Check out notifier
+        uses: actions/checkout@v4
+
+      - name: Validate secrets
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_BOT_TOKEN)) { throw 'TELEGRAM_BOT_TOKEN secret is missing.' }
+          if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_CHAT_ID)) { throw 'TELEGRAM_CHAT_ID secret is missing.' }
+
+      - name: Create temporary configuration
+        shell: pwsh
+        run: |
+          @{
+            telegramBotToken = $env:TELEGRAM_BOT_TOKEN
+            telegramChatId = $env:TELEGRAM_CHAT_ID
+          } | ConvertTo-Json | Set-Content -LiteralPath ./config.json -Encoding utf8
+
+      - name: Send optional test message
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.send_test }}
+        shell: pwsh
+        run: ./test-telegram.ps1
+
+      - name: Check latest 40 notices
+        shell: pwsh
+        run: ./knou-notifier.ps1
+
+      - name: Save new notice baseline
+        shell: bash
+        run: |
+          if git diff --quiet -- state.json; then
+            echo "No new notice state to save."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "Update KNOU notice state"
+          git push
