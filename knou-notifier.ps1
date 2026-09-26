@@ -1,7 +1,8 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [switch]$DryRun,
     [switch]$Initialize,
+    [switch]$TestLatest,
     [string]$ConfigPath = '',
     [string]$StatePath = ''
 )
@@ -9,9 +10,13 @@ param(
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) { $ConfigPath = Join-Path $PSScriptRoot 'config.json' }
 if ([string]::IsNullOrWhiteSpace($StatePath)) { $StatePath = Join-Path $PSScriptRoot 'state.json' }
-$BaseUrl = 'https://www.knou.ac.kr'
-$ListUrl = "$BaseUrl/bbs/knou/51/artclList.do"
-$UserAgent = 'KNOU-Notice-Notifier/1.0 (+personal notice checker)'
+$UserAgent = 'KNOU-Notice-Notifier/2.0 (+personal notice checker)'
+$Sources = @(
+    [pscustomobject]@{ key = 'school'; name = '학교 전체 공지'; baseUrl = 'https://www.knou.ac.kr'; listPath = '/bbs/knou/51/artclList.do'; boardPath = '/bbs/knou/51' },
+    [pscustomobject]@{ key = 'socialwelfare'; name = '사회복지학과 공지'; baseUrl = 'https://socialwelfare.knou.ac.kr'; listPath = '/bbs/socialwelfare/2111/artclList.do'; boardPath = '/bbs/socialwelfare/2111' },
+    [pscustomobject]@{ key = 'seoul'; name = '서울지역대학 공지'; baseUrl = 'https://wseoul.knou.ac.kr'; listPath = '/bbs/regional/2062/artclList.do?bbsClSeq=2141'; boardPath = '/bbs/regional/2062' },
+    [pscustomobject]@{ key = 'admission'; name = '입학공지'; baseUrl = 'https://admission.knou.ac.kr'; listPath = '/bbs/admission/29/artclList.do'; boardPath = '/bbs/admission/29' }
+)
 
 function ConvertFrom-HtmlText {
     param([AllowEmptyString()][string]$Html)
@@ -35,11 +40,12 @@ function Invoke-KnouRequest {
 }
 
 function Get-NoticeRows {
-    param([Parameter(Mandatory)][string]$Html)
+    param([Parameter(Mandatory)][string]$Html, [Parameter(Mandatory)]$Source)
     $rows = [regex]::Matches($Html, '<tr\b[^>]*>([\s\S]*?)</tr>', 'IgnoreCase')
+    $escapedBoardPath = [regex]::Escape($Source.boardPath)
     foreach ($row in $rows) {
         $body = $row.Groups[1].Value
-        $link = [regex]::Match($body, 'href="(?<url>/bbs/knou/51/(?<id>\d+)/artclView\.do[^"]*)"', 'IgnoreCase')
+        $link = [regex]::Match($body, 'href="(?<url>' + $escapedBoardPath + '/(?<id>\d+)/artclView\.do[^\"]*)"', 'IgnoreCase')
         if (-not $link.Success) { continue }
         $titleMatch = [regex]::Match($body, '<td\b[^>]*class="[^"]*td-subject[^"]*"[^>]*>(?<title>[\s\S]*?)</td>', 'IgnoreCase')
         $dateMatch = [regex]::Match($body, '<td\b[^>]*class="[^"]*td-date[^"]*"[^>]*>(?<date>[\s\S]*?)</td>', 'IgnoreCase')
@@ -52,27 +58,30 @@ function Get-NoticeRows {
             $title = $Matches.rest.Trim()
         }
         [pscustomobject]@{
-            id       = $link.Groups['id'].Value
+            id = $link.Groups['id'].Value
+            sourceKey = $Source.key
+            sourceName = $Source.name
             category = $category
-            title    = $title
-            writer   = (ConvertFrom-HtmlText $writerMatch.Groups['writer'].Value)
-            date     = (ConvertFrom-HtmlText $dateMatch.Groups['date'].Value).Replace('.', '-')
-            url      = $BaseUrl + $link.Groups['url'].Value.Split('?')[0]
+            title = $title
+            writer = (ConvertFrom-HtmlText $writerMatch.Groups['writer'].Value)
+            date = (ConvertFrom-HtmlText $dateMatch.Groups['date'].Value).Replace('.', '-')
+            url = $Source.baseUrl + $link.Groups['url'].Value.Split('?')[0]
         }
     }
 }
 
 function Get-LatestNotices {
-    param([int]$Count = 40)
+    param([Parameter(Mandatory)]$Source, [int]$Count = 40)
     $found = [ordered]@{}
     for ($page = 1; $page -le 10 -and $found.Count -lt $Count; $page++) {
-        $html = Invoke-KnouRequest "${ListUrl}?page=$page"
-        foreach ($notice in (Get-NoticeRows $html)) {
+        $separator = if ($Source.listPath.Contains('?')) { '&' } else { '?' }
+        $html = Invoke-KnouRequest ($Source.baseUrl + $Source.listPath + $separator + "page=$page")
+        foreach ($notice in (Get-NoticeRows -Html $html -Source $Source)) {
             if (-not $found.Contains($notice.id)) { $found[$notice.id] = $notice }
             if ($found.Count -ge $Count) { break }
         }
     }
-    if ($found.Count -lt $Count) { throw "최신 공지를 $Count개 수집하지 못했습니다. 수집된 개수: $($found.Count)" }
+    if ($found.Count -eq 0) { throw "$($Source.name)에서 공지를 수집하지 못했습니다." }
     return @($found.Values)
 }
 
@@ -90,10 +99,7 @@ function Get-NoticeSummary {
         if ([string]::IsNullOrWhiteSpace($bodyText)) { return '본문 요약을 가져오지 못했습니다.' }
         $bodyText = [regex]::Replace($bodyText, '\s+', ' ').Trim()
         if ($bodyText.Length -le $MaxLength) { return $bodyText }
-        $cut = $bodyText.Substring(0, $MaxLength)
-        $sentence = [regex]::Match($cut, '^(.{80,}[.!?。]|.{80,}다\.)\s')
-        if ($sentence.Success) { return $sentence.Groups[1].Value }
-        return $cut.TrimEnd() + '…'
+        return $bodyText.Substring(0, $MaxLength).TrimEnd() + '…'
     } catch {
         return '본문 요약을 가져오지 못했습니다.'
     }
@@ -111,6 +117,23 @@ function Send-TelegramMessage {
     Invoke-RestMethod -Method Post -Uri $uri -Body $payload -TimeoutSec 45 | Out-Null
 }
 
+function New-NoticeMessage {
+    param([Parameter(Mandatory)]$Notice, [switch]$IsTest)
+    $summary = Get-NoticeSummary -Notice $Notice
+    $heading = if ($IsTest) { '방송대 공지 알림 테스트' } else { '방송대 새 공지' }
+    $categoryLine = if ([string]::IsNullOrWhiteSpace($Notice.category)) { '' } else { "`n분류: $(Escape-TelegramHtml $Notice.category)" }
+    return @"
+<b>$heading</b>
+게시판: $(Escape-TelegramHtml $Notice.sourceName)$categoryLine
+제목: $(Escape-TelegramHtml $Notice.title)
+작성: $(Escape-TelegramHtml $Notice.writer) · $(Escape-TelegramHtml $Notice.date)
+
+$(Escape-TelegramHtml $summary)
+
+<a href="$($Notice.url)">공지 바로가기</a>
+"@
+}
+
 function Write-Log {
     param([string]$Message)
     $logPath = Join-Path $PSScriptRoot 'notifier.log'
@@ -126,37 +149,54 @@ try {
         throw 'config.json에 텔레그램 봇 토큰과 채팅 ID를 설정해 주세요.'
     }
 
-    $notices = @(Get-LatestNotices -Count 40)
-    $currentIds = @($notices | ForEach-Object id)
-    if ($Initialize -or -not (Test-Path -LiteralPath $StatePath)) {
-        @{ seenIds = $currentIds; initializedAt = (Get-Date).ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath $StatePath -Encoding utf8
-        Write-Log "기준점 저장 완료: 최신 공지 $($currentIds.Count)개 (알림 없음)"
+    $noticesBySource = @{}
+    foreach ($source in $Sources) { $noticesBySource[$source.key] = @(Get-LatestNotices -Source $source -Count 40) }
+
+    if ($TestLatest) {
+        foreach ($source in $Sources) {
+            $latest = @($noticesBySource[$source.key] | Sort-Object { [long]$_.id } -Descending)[0]
+            $message = New-NoticeMessage -Notice $latest -IsTest
+            if ($DryRun) { Write-Host "`n$message`n" } else { Send-TelegramMessage -Config $config -Message $message }
+        }
+        Write-Log "게시판별 최신 공지 테스트 완료: $($Sources.Count)개"
         exit 0
     }
 
-    $state = Get-Content -Raw -LiteralPath $StatePath | ConvertFrom-Json
-    $seen = @{}; foreach ($id in @($state.seenIds)) { $seen[[string]$id] = $true }
-    $newNotices = @($notices | Where-Object { -not $seen.ContainsKey([string]$_.id) })
-
-    foreach ($notice in @($newNotices | Select-Object -Last 40 | Sort-Object id)) {
-        $summary = Get-NoticeSummary -Notice $notice
-        $message = @"
-<b>방송대 새 공지</b>
-분류: $(Escape-TelegramHtml $notice.category)
-제목: $(Escape-TelegramHtml $notice.title)
-작성: $(Escape-TelegramHtml $notice.writer) · $(Escape-TelegramHtml $notice.date)
-
-$(Escape-TelegramHtml $summary)
-
-<a href="$($notice.url)">공지 바로가기</a>
-"@
-        if ($DryRun) { Write-Host "`n$message`n" } else { Send-TelegramMessage -Config $config -Message $message }
+    $stateSources = @{}
+    if (Test-Path -LiteralPath $StatePath) {
+        $oldState = Get-Content -Raw -LiteralPath $StatePath | ConvertFrom-Json
+        if ($oldState.sources) {
+            foreach ($property in $oldState.sources.PSObject.Properties) { $stateSources[$property.Name] = @($property.Value) }
+        } elseif ($oldState.seenIds) {
+            $stateSources['school'] = @($oldState.seenIds)
+        }
     }
 
-    if ($newNotices.Count -gt 0) {
-        @{ seenIds = $currentIds; checkedAt = (Get-Date).ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath $StatePath -Encoding utf8
+    $newBySource = @{}
+    foreach ($source in $Sources) {
+        $current = @($noticesBySource[$source.key])
+        if ($Initialize -or -not $stateSources.ContainsKey($source.key)) {
+            $stateSources[$source.key] = @($current | ForEach-Object id)
+            $newBySource[$source.key] = @()
+            continue
+        }
+        $seen = @{}; foreach ($id in @($stateSources[$source.key])) { $seen[[string]$id] = $true }
+        $newBySource[$source.key] = @($current | Where-Object { -not $seen.ContainsKey([string]$_.id) })
+        $stateSources[$source.key] = @($current | ForEach-Object id)
     }
-    Write-Log "확인 완료: 최신 40개, 새 공지 $($newNotices.Count)개"
+
+    foreach ($source in $Sources) {
+        foreach ($notice in @($newBySource[$source.key] | Sort-Object { [long]$_.id })) {
+            $message = New-NoticeMessage -Notice $notice
+            if ($DryRun) { Write-Host "`n$message`n" } else { Send-TelegramMessage -Config $config -Message $message }
+        }
+    }
+
+    $stateObject = [ordered]@{ sources = [ordered]@{}; checkedAt = (Get-Date).ToString('o') }
+    foreach ($source in $Sources) { $stateObject.sources[$source.key] = @($stateSources[$source.key]) }
+    $stateObject | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding utf8
+    $newCount = 0; foreach ($source in $Sources) { $newCount += @($newBySource[$source.key]).Count }
+    Write-Log "확인 완료: 게시판 $($Sources.Count)개, 새 공지 $newCount개"
 } catch {
     Write-Log "오류: $($_.Exception.Message)"
     exit 1
